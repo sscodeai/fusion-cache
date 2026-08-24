@@ -238,6 +238,34 @@ def create_app(
         }
         return JSONResponse(content=payload)
 
+    @app.post("/v1/cache/invalidate")
+    async def invalidate_cache(request: Request) -> Response:
+        """Evict cache entries. Body: {"all": true} or {"request": {...}}.
+
+        Requires gateway auth (same as /v1/chat/completions). Useful after a
+        model/upstream change when stale cached responses must be dropped.
+        """
+        cache: FusionCache = app.state.cache
+        auth_err = _check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": {"message": "invalid JSON body"}})
+
+        if body.get("all"):
+            n = await cache.invalidate_all()
+            return JSONResponse(content={"evicted": n, "all": True})
+        req = body.get("request")
+        if not req or not isinstance(req, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "body must be {\"all\": true} or {\"request\": {...}}"}},
+            )
+        removed = await cache.invalidate(req)
+        return JSONResponse(content={"evicted": 1 if removed else 0})
+
     @app.get("/metrics")
     async def metrics(request: Request) -> Response:
         cache: FusionCache = app.state.cache

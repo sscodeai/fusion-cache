@@ -483,6 +483,28 @@ class FusionCache:
         return str(request.get("prompt", ""))
 
     # ------------------------------------------------------------ lifecycle
+    async def invalidate(self, request: Mapping[str, Any]) -> bool:
+        """Evict a specific request from both stores. Returns True if anything was removed."""
+        key = self._exact_key(dict(request))
+        removed = False
+        if self.config.enable_exact:
+            removed = await self.store.adelete(key) or removed
+        if self.config.enable_semantic:
+            removed = await self.semantic_store.adelete(f"sem:{key}") or removed
+        return removed
+
+    async def invalidate_all(self) -> int:
+        """Evict everything from both stores. Returns number of entries cleared."""
+        n = 0
+        if self.config.enable_exact:
+            n += await self.store.asize()
+            await self.store.aclear()
+        if self.config.enable_semantic:
+            n += await self.semantic_store.asize()
+            await self.semantic_store.aclear()
+        self.breaker.reset()
+        return n
+
     async def aclose(self) -> None:
         if self._closed:
             return
