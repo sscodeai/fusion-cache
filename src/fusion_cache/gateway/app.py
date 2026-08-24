@@ -36,6 +36,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from fusion_cache.config import FusionCacheConfig
 from fusion_cache.core.pipeline import FusionCache
+from fusion_cache.gateway.ratelimit import SlidingWindowRateLimiter
 from fusion_cache.gateway.upstream import call_upstream_nonstream, call_upstream_stream
 from fusion_cache.stores.redis import RedisStore
 
@@ -84,6 +85,34 @@ def create_app(
     app.state.gateway_api_key = gateway_api_key if gateway_api_key is not None else _gateway_api_key()
     origins = cors_origins if cors_origins is not None else _cors_origins()
 
+    # ---- rate limiter ------------------------------------------------------
+    rate_limit = int(os.environ.get("FUSION_RATE_LIMIT", "0"))
+    rate_limit_key = os.environ.get("FUSION_RATE_LIMIT_KEY", "api_key")
+    app.state.ratelimiter = SlidingWindowRateLimiter(rate_limit) if rate_limit > 0 else None
+    app.state.rate_limit_key = rate_limit_key
+
+    def _rate_limit_key_for(request: Request) -> str:
+        if app.state.rate_limit_key == "ip":
+            return request.client.host if request.client else "unknown"
+        # default: api key (or the configured gateway key)
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            return auth[len("Bearer "):]
+        return "anonymous"
+
+    def _check_rate_limit(request: Request) -> Optional[JSONResponse]:
+        rl = app.state.ratelimiter
+        if rl is None:
+            return None
+        key = _rate_limit_key_for(request)
+        if not rl.allow(key):
+            return JSONResponse(
+                status_code=429,
+                content={"error": {"message": "rate limit exceeded", "retry_after_s": int(rl.window_s)}},
+                headers={"Retry-After": str(int(rl.window_s))},
+            )
+        return None
+
     # ---- middleware: CORS -------------------------------------------------
     if origins:
         from fastapi.middleware.cors import CORSMiddleware
@@ -117,6 +146,9 @@ def create_app(
         auth_err = _check_auth(request)
         if auth_err:
             return auth_err
+        rate_err = _check_rate_limit(request)
+        if rate_err:
+            return rate_err
         # Passthrough to the upstream models endpoint (best effort).
         from httpx import AsyncClient
 
@@ -137,6 +169,10 @@ def create_app(
         auth_err = _check_auth(request)
         if auth_err:
             return auth_err
+
+        rate_err = _check_rate_limit(request)
+        if rate_err:
+            return rate_err
 
         try:
             body = await request.json()
