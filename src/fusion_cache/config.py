@@ -74,6 +74,11 @@ class FusionCacheConfig(BaseModel):
     # --- upstream ------------------------------------------------------------
     upstream_timeout: float = Field(default=60.0, gt=0.0)
 
+    # --- circuit breaker -----------------------------------------------------
+    circuit_breaker_enabled: bool = True
+    circuit_breaker_failure_threshold: int = Field(default=5, ge=1)
+    circuit_breaker_cooldown_s: float = Field(default=30.0, ge=0.0)
+
     @field_validator("embedder", mode="before")
     @classmethod
     def _embedder_dict(cls, v):
