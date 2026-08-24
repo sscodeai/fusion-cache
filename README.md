@@ -4,9 +4,9 @@ Fusion cache for LLM APIs: **exact → semantic → prefix-cache accounting** in
 framework-agnostic Python middleware layer. Drop-in wrapper for the OpenAI SDK,
 DeepSeek-first pricing model, honest money-saved metrics.
 
-> **Status:** MVP (v0.1.0). Wrapper form, in-memory store, all three layers,
-> metrics. Gateway form (FastAPI reverse proxy), Redis store, dashboard page,
-> and CLI ship in v1.1.
+> **Status:** v0.1.0 (MVP) + **v1.1 (gateway form)**: FastAPI OpenAI-compatible
+> reverse proxy, Redis store, CLI, Docker, and self-contained HTML dashboard.
+> Wrapper form, in-memory store, all three layers, metrics — all shipped.
 
 ---
 
@@ -159,6 +159,9 @@ src/fusion_cache/
 │   └── accounting.py      # prompt_cache_hit/miss_tokens → $ saved
 ├── metrics/
 │   └── registry.py        # per-layer hit/miss, hit rate, $ saved, P50/P95
+├── gateway/
+│   └── app.py             # FastAPI OpenAI-compatible reverse proxy (v1.1)
+├── cli.py                 # fusion-cache serve / stats / check (v1.1)
 └── wrapper/
     └── openai.py          # CachedOpenAI: drop-in sync/async OpenAI wrapper
 ```
@@ -177,6 +180,75 @@ src/fusion_cache/
 cost saved (USD), prefix-cache tokens, and P50/P95/mean latency from a rolling
 buffer. `cache.stats_dict()` combines it with aggregate counters. This is the
 input for the v1.1 dashboard.
+
+---
+
+## Gateway (v1.1)
+
+The FastAPI gateway is an OpenAI-compatible reverse proxy: your app talks to
+the gateway exactly like it talks to DeepSeek/OpenAI, and the gateway routes
+every request through the fusion cache before hitting the real upstream.
+
+### Run it
+
+```bash
+pip install -e ".[gateway,redis]"
+
+# In-memory store:
+fusion-cache serve --port 8000
+
+# With Redis (shared cache across instances):
+fusion-cache serve --port 8000 --redis redis://localhost:6379/0
+```
+
+Environment variables:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `FUSION_UPSTREAM_BASE_URL` | `https://api.deepseek.com` | upstream base URL |
+| `FUSION_UPSTREAM_API_KEY` / `DEEPSEEK_API_KEY` | — | upstream API key |
+| `REDIS_URL` | — | enable RedisStore (else in-memory) |
+| `FUSION_HOST` / `FUSION_PORT` | `0.0.0.0` / `8000` | bind address |
+
+### Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI-compatible chat completions through the cache (streaming via SSE supported) |
+| `GET /v1/models` | model list (passthrough, with fallback) |
+| `GET /metrics` | Prometheus metrics (or JSON with `Accept: application/json`) |
+| `GET /dashboard` | self-contained HTML dashboard (no CDN) |
+| `GET /health` | liveness probe |
+
+Non-streaming responses carry a `_fusion_cache` metadata block:
+
+```json
+{
+  "_fusion_cache": {
+    "layer": "exact",
+    "hit": true,
+    "cached": true,
+    "prefix_hit": true,
+    "cost_saved_usd": 0.000017,
+    "latency_ms": 0.42
+  }
+}
+```
+
+### Docker
+
+```bash
+docker compose up --build
+# gateway on :8000, redis on :6379
+```
+
+### CLI
+
+```bash
+fusion-cache serve --port 8000            # start gateway
+fusion-cache stats --url http://localhost:8000   # print cache stats
+fusion-cache check                        # environment health check
+```
 
 ---
 
