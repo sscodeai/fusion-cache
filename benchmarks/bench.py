@@ -405,9 +405,13 @@ async def main() -> None:
     parser.add_argument("--paraphrase", action="store_true", help="use paraphrase groups (each task asked 3 ways) to exercise the L2 semantic layer")
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENCODE_GO_API_KEY") or os.environ.get("OPENCODE_API_KEY")
+    api_key = (
+        os.environ.get("FUSION_UPSTREAM_API_KEY")
+        or os.environ.get("OPENCODE_GO_API_KEY")
+        or os.environ.get("OPENCODE_API_KEY")
+    )
     if not api_key:
-        raise SystemExit("OPENCODE_GO_API_KEY / OPENCODE_API_KEY not set")
+        raise SystemExit("set FUSION_UPSTREAM_API_KEY / OPENCODE_GO_API_KEY / OPENCODE_API_KEY")
 
     if args.paraphrase:
         tasks: List[Any] = PARAPHRASE_GROUPS[: args.tasks]
