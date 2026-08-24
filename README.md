@@ -373,6 +373,48 @@ and latency; the framework-agnostic script lets you measure your own.
 
 ---
 
+## Related work (academic basis)
+
+The three layers map onto an active research lineage. If you're coming from
+the literature, this is where each layer lives:
+
+### Semantic caching (L2)
+
+- **MeanCache: User-Centric Semantic Caching for LLM Web Services** —
+  arXiv:2403.02694 (2024). Foundational semantic-cache work: embedding
+  similarity + cached-response reuse. This is the direct ancestor of L2.
+- **GPT Semantic Cache: Reducing LLM Costs and Latency via Semantic Embedding
+  Caching** — arXiv:2411.05276 (2024). Semantic embedding caching for cost and
+  latency reduction — the same pitch fusion-cache makes.
+- **From Exact Hits to Close Enough: Semantic Caching for LLM Embeddings** —
+  arXiv:2603.03301 (2026). The exact→semantic progression, which is exactly
+  the L1→L2 design here.
+- **Continuous Semantic Caching for Low-Cost LLM Serving** —
+  arXiv:2604.20021 (2026). Recent continuous-semantic-cache work — the
+  direction is active.
+- **Closing the Calibration Gap in Semantic Caching** — arXiv:2606.19719
+  (2026). Calibrating semantic-cache thresholds to avoid wrong hits — the
+  academic version of our false-positive guardrail.
+
+### Prefix / KV caching (L3 relies on the upstream's mechanism)
+
+- **Marconi: Prefix Caching for the Era of Hybrid LLMs** — arXiv:2411.19379
+  (2024, MLSys '25 Outstanding Paper). System-level prefix caching; the
+  academic counterpart of the automatic prefix caching DeepSeek/OpenAI
+  provide, which L3 accounts for.
+- **Not All Tokens Are Worth Caching: Learning Semantic-Aware Eviction for
+  LLM Prefix Caches** — arXiv:2605.18825 (2026). Semantic-aware eviction in
+  prefix caches — semantic + prefix fusion in the same spirit as this project.
+
+### Memory / context compression (future direction for L2)
+
+- **AgentKVShift: Efficient KV Cache Reuse for Agentic Memory Systems** —
+  arXiv:2607.21604 (2026). KV reuse for agent memory — the same idea as
+  observational-memory-style compression; a natural evolution path for the
+  semantic layer on long-running agents.
+
+---
+
 ## License
 
 Apache-2.0. Built from scratch; reference material only was reused from
