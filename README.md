@@ -313,6 +313,25 @@ What this shows:
 - P95 stays high (~11 s) because the 20 cold misses still hit the slow
   upstream — caching accelerates hits, it can't fix upstream latency.
 
+### Paraphrase workload — the L2 semantic layer's payoff
+
+L1 exact caching only catches *identical* requests. When users rephrase the
+same question, only the L2 semantic layer can connect them. Benchmarked with
+8 question groups × 3 paraphrases each against `ox-alpha-free` (the free
+endpoint was flaky — 503s — so this is a 2-group subset; the script
+`--paraphrase` mode skips failed requests instead of aborting):
+
+| Config | Req | L1 hit | L2 hit | Upstream | Hit rate | P50 (ms) |
+|---|---|---|---|---|---|---|
+| fusion (L1+L3 only) | 6 | 0 | 0 | 6 | 0% | 21107.5 |
+| **fusion+sem (L1+L2+L3)** | 6 | 0 | **5** | 1 | **83%** | **0.4** |
+
+Without the semantic layer every paraphrase misses (different text → L1
+can't match) and pays the ~21 s upstream. With it, 5/6 paraphrases are served
+from cache in **0.4 ms**. The local deterministic embedder used here (char
+n-grams) is a stand-in for any OpenAI-compatible `/embeddings` endpoint —
+plug your own via `FUSION_EMBED_BASE_URL` / `FUSION_EMBED_API_KEY`.
+
 ### Methodology
 
 1. **Workload:** N distinct tasks with shared system prompt + stable
