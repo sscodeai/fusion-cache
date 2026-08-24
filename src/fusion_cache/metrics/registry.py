@@ -96,6 +96,12 @@ class MetricsRegistry:
             self._layers.clear()
             self._latencies.clear()
 
+    def latency_series(self, n: int = 60) -> List[float]:
+        """Most recent latency samples (oldest → newest), for sparklines."""
+        with self._lock:
+            xs = list(self._latencies)
+        return xs[-n:]
+
     def layer_summary(self, layer: str) -> Dict[str, Any]:
         with self._lock:
             entry = self._layers.get(layer, {"hits": 0, "misses": 0, "cost_saved_usd": 0.0, "tokens": 0, "errors": 0})

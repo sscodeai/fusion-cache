@@ -29,7 +29,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -245,7 +245,8 @@ def create_app(
     async def dashboard() -> str:
         cache: FusionCache = app.state.cache
         stats = cache.stats_dict()
-        return _render_dashboard(stats)
+        series = cache.metrics.latency_series(120)
+        return _render_dashboard(stats, latency_series=series)
 
     return app
 
@@ -259,17 +260,42 @@ def _response_to_dict(resp: Any) -> Dict[str, Any]:
     return {"object": "chat.completion", "choices": [], "usage": {}}
 
 
-def _render_dashboard(stats: Dict[str, Any]) -> str:
-    """Self-contained HTML dashboard (inline CSS, no external resources)."""
+def _render_dashboard(stats: Dict[str, Any], latency_series: Optional[List[float]] = None) -> str:
+    """Self-contained HTML dashboard (inline CSS/SVG, no external resources)."""
     metrics = stats.get("metrics", {})
+    layers = metrics.get("layers", metrics) if isinstance(metrics, dict) else {}
+    total_req = stats.get("requests", 0) or sum(
+        v.get("hits", 0) + v.get("misses", 0) for v in layers.values() if isinstance(v, dict)
+    )
+    total_err = sum(v.get("errors", 0) for v in layers.values() if isinstance(v, dict))
+    err_rate = (total_err / total_req) if total_req else 0.0
+
+    lat = metrics.get("latency", {}) if isinstance(metrics, dict) else {}
+    p50 = lat.get("p50_ms", 0.0)
+    p95 = lat.get("p95_ms", 0.0)
+    mean = lat.get("mean_ms", 0.0)
+    uptime = metrics.get("uptime_s", 0) if isinstance(metrics, dict) else 0
+
     layers_html = ""
-    for layer, d in metrics.items():
+    for layer, d in layers.items():
         if not isinstance(d, dict):
             continue
-        parts = " · ".join(f"{k}={v}" for k, v in d.items() if isinstance(v, (int, float)))
-        layers_html += f"<tr><td><code>{layer}</code></td><td>{parts}</td></tr>"
+        hits = d.get("hits", 0)
+        misses = d.get("misses", 0)
+        errors = d.get("errors", 0)
+        saved = d.get("cost_saved_usd", 0.0)
+        tokens = d.get("tokens", 0)
+        total = hits + misses
+        rate = (hits / total) if total else 0.0
+        layers_html += (
+            f"<tr><td><code>{layer}</code></td>"
+            f"<td>{hits}</td><td>{misses}</td><td>{errors}</td>"
+            f"<td>{rate:.0%}</td><td>${saved:.6f}</td><td>{tokens}</td></tr>"
+        )
     if not layers_html:
-        layers_html = "<tr><td colspan=2>no metrics yet</td></tr>"
+        layers_html = "<tr><td colspan=7>no metrics yet</td></tr>"
+
+    spark = _sparkline_svg(latency_series or [])
 
     return f"""<!doctype html>
 <html lang="en">
@@ -278,37 +304,71 @@ def _render_dashboard(stats: Dict[str, Any]) -> str:
 <title>fusion-cache dashboard</title>
 <style>
   body {{ font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; background:#0f1117; color:#e6e6e6; margin:0; padding:40px 20px; }}
-  .wrap {{ max-width:760px; margin:0 auto; }}
+  .wrap {{ max-width:860px; margin:0 auto; }}
   h1 {{ font-size:1.6rem; border-bottom:1px solid #2a2d3a; padding-bottom:12px; }}
   .cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin:24px 0; }}
   .card {{ background:#171a23; border:1px solid #2a2d3a; border-radius:10px; padding:16px; }}
   .card .v {{ font-size:1.5rem; font-weight:700; color:#4fd1c5; }}
   .card .l {{ font-size:.75rem; color:#8b90a0; text-transform:uppercase; letter-spacing:.05em; margin-top:4px; }}
+  .card .v.red {{ color:#f87171; }}
+  .card .v.yellow {{ color:#fbbf24; }}
   table {{ width:100%; border-collapse:collapse; background:#171a23; border-radius:10px; overflow:hidden; }}
   th,td {{ text-align:left; padding:10px 14px; border-bottom:1px solid #2a2d3a; font-size:.85rem; }}
   th {{ background:#1c2030; color:#8b90a0; text-transform:uppercase; font-size:.7rem; letter-spacing:.05em; }}
   .muted {{ color:#8b90a0; }}
+  .spark {{ background:#171a23; border:1px solid #2a2d3a; border-radius:10px; padding:12px; margin:18px 0; }}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>⚡ fusion-cache dashboard</h1>
   <div class="cards">
-    <div class="card"><div class="v">{stats['requests']}</div><div class="l">requests</div></div>
-    <div class="card"><div class="v">{stats['exact_hits']}</div><div class="l">L1 exact hits</div></div>
-    <div class="card"><div class="v">{stats['semantic_hits']}</div><div class="l">L2 semantic hits</div></div>
-    <div class="card"><div class="v">{stats['prefix_hits']}</div><div class="l">L3 prefix hits</div></div>
-    <div class="card"><div class="v">{stats['hit_rate']:.2%}</div><div class="l">hit rate</div></div>
-    <div class="card"><div class="v">${stats['cost_saved_usd']:.4f}</div><div class="l">cost saved</div></div>
+    <div class="card"><div class="v">{total_req}</div><div class="l">requests</div></div>
+    <div class="card"><div class="v">{stats.get('exact_hits', 0)}</div><div class="l">L1 exact hits</div></div>
+    <div class="card"><div class="v">{stats.get('semantic_hits', 0)}</div><div class="l">L2 semantic hits</div></div>
+    <div class="card"><div class="v">{stats.get('prefix_hits', 0)}</div><div class="l">L3 prefix hits</div></div>
+    <div class="card"><div class="v">{stats.get('hit_rate', 0):.2%}</div><div class="l">hit rate</div></div>
+    <div class="card"><div class="v">${stats.get('cost_saved_usd', 0):.4f}</div><div class="l">cost saved</div></div>
+    <div class="card"><div class="v {'red' if err_rate > 0.05 else 'yellow' if err_rate > 0 else ''}">{err_rate:.2%}</div><div class="l">error rate</div></div>
+    <div class="card"><div class="v">{p50:.0f}ms</div><div class="l">P50 latency</div></div>
+    <div class="card"><div class="v">{p95:.0f}ms</div><div class="l">P95 latency</div></div>
+    <div class="card"><div class="v">{uptime:.0f}s</div><div class="l">uptime</div></div>
+  </div>
+  <div class="spark">
+    <div class="muted" style="font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Latency trend (recent requests, ms)</div>
+    {spark}
   </div>
   <h2 class="muted" style="font-size:1rem">Per-layer metrics</h2>
   <table>
-    <tr><th>layer</th><th>values</th></tr>
+    <tr><th>layer</th><th>hits</th><th>misses</th><th>errors</th><th>hit rate</th><th>$ saved</th><th>tokens</th></tr>
     {layers_html}
   </table>
 </div>
 </body>
 </html>"""
+
+
+def _sparkline_svg(series: List[float], width: int = 820, height: int = 60) -> str:
+    """Inline SVG sparkline of the latency series (no external JS)."""
+    if len(series) < 2:
+        return '<span class="muted">collecting data…</span>'
+    vmax = max(series) or 1.0
+    vmin = min(series)
+    rng = (vmax - vmin) or 1.0
+    n = len(series)
+    points = []
+    for i, v in enumerate(series):
+        x = (i / (n - 1)) * width
+        y = height - ((v - vmin) / rng) * (height - 8) - 4
+        points.append(f"{x:.1f},{y:.1f}")
+    poly = " ".join(points)
+    return (
+        f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+        f'xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">'
+        f'<polyline points="{poly}" fill="none" stroke="#4fd1c5" stroke-width="2" stroke-linejoin="round"/>'
+        f'<circle cx="{width:.1f}" cy="{points[-1].split(",")[1]}" r="3" fill="#4fd1c5"/>'
+        f'</svg>'
+    )
 
 
 app = create_app()
