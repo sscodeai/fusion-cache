@@ -4,9 +4,13 @@ Fusion cache for LLM APIs: **exact → semantic → prefix-cache accounting** in
 framework-agnostic Python middleware layer. Drop-in wrapper for the OpenAI SDK,
 DeepSeek-first pricing model, honest money-saved metrics.
 
-> **Status:** v0.1.0 (MVP) + **v1.1 (gateway form)**: FastAPI OpenAI-compatible
-> reverse proxy, Redis store, CLI, Docker, and self-contained HTML dashboard.
-> Wrapper form, in-memory store, all three layers, metrics — all shipped.
+> **Status:** v0.1.0 — production-ready core. Three-layer fusion cache
+> (exact → semantic → prefix accounting), OpenAI-compatible gateway
+> (auth, CORS, multi-provider, rate limiting), Redis shared cache,
+> circuit breaker with graceful degradation, single-flight (no cache
+> stampede), cache invalidation API, Prometheus metrics + Grafana dashboard
+> + alerting rules. See [DEPLOYMENT.md](DEPLOYMENT.md) for production
+> deployment.
 
 ---
 
