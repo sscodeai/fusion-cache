@@ -1,0 +1,25 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      FUSION_UPSTREAM_BASE_URL: ${FUSION_UPSTREAM_BASE_URL:-https://api.deepseek.com}
+      FUSION_UPSTREAM_API_KEY: ${FUSION_UPSTREAM_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      REDIS_URL: redis://redis:6379/0
+      SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.93}
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:
