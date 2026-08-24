@@ -287,31 +287,48 @@ ships fusion + DeepSeek accounting as a general middleware. See
 
 ## Benchmark
 
-**Real end-to-end benchmark** against `ox-alpha-free` (opencode.ai Console Go
-endpoint, free tier) — 20 distinct tasks × 3 reps each (60 requests per
-config), shared system prompt, `temperature=0.2`, `stream=False`. Run with
-`python benchmarks/bench.py` (add your opencode/DeepSeek key as
-`OPENCODE_GO_API_KEY` / `DEEPSEEK_API_KEY`).
+Real end-to-end results. Run `python benchmarks/bench.py` with any
+OpenAI-compatible endpoint (set `FUSION_UPSTREAM_API_KEY` +
+`--base-url`/`--model`).
 
-| Config | Req | L1 hit | L2 hit | Upstream | Prefix-hit reqs | Hit rate | Cached-token ratio | P50 (ms) | P95 (ms) | $ saved |
-|---|---|---|---|---|---|---|---|---|---|---|
-| baseline (no cache) | 60 | 0 | 0 | 60 | 60 | 0% | 53% | 7498.1 | 11783.8 | $0.000000 |
-| fusion | 60 | 40 | 0 | 20 | 60 | 67% | 53% | 0.2 | 11436.4 | $0.000273 |
-| fusion+sem | 60 | 40 | 0 | 20 | 60 | 67% | 53% | 0.2 | 11981.5 | $0.000273 |
+### L1+L2 fusion on a stable endpoint (deepseek-v4-flash via commandcode)
+
+20 distinct tasks × 3 reps (60 requests per config), shared system prompt,
+`temperature=0.2`, `stream=False`.
+
+| Config | Req | L1 hit | L2 hit | Upstream | Hit rate | P50 (ms) | P95 (ms) |
+|---|---|---|---|---|---|---|---|
+| baseline (no cache) | 60 | 0 | 0 | 60 | 0% | 3214.2 | 6539.2 |
+| fusion (L1+L3) | 60 | 40 | 0 | 20 | 67% | 0.2 | 3450.8 |
+| **fusion+sem (L1+L2+L3)** | 60 | 4 | **54** | **2** | **97%** | **0.1** | **0.7** |
 
 What this shows:
 
-- **67% of requests are served from the L1 exact cache** (0.2 ms median —
-  ~37,000× faster than the 7.5 s upstream median), with only 20/60 upstream
-  calls.
-- **Every request also benefits from the upstream's own prefix cache**
-  (`cached-token ratio 53%`) — fusion-cache captures and reports this as money
-  saved via `prompt_cache_hit_tokens` / `cached_tokens` accounting.
-- **L2 semantic adds nothing here** because the workload repeats identical
-  prompts (L1 already catches them); it pays off on paraphrase-heavy
-  workloads. The benchmark script ships with both modes.
+- **67% of requests are served from the L1 exact cache** with just the exact
+  layer (0.2 ms median vs 3.2 s upstream — ~16,000×).
+- **Adding the L2 semantic layer lifts the hit rate to 97%**: L1 catches the
+  4 identical repeats, L2 catches the other 54 (same questions asked slightly
+  differently across the workload). Only 2/60 calls reach the upstream, and
+  even **P95 drops to 0.7 ms**.
+- This endpoint (commandcode's deepseek) does **not** enable upstream prefix
+  caching (`cached_tokens` is always 0), so L3 accounting is 0 here — the L1/L2
+  layers carry the win.
+
+### L3 prefix-cache accounting on a caching upstream (ox-alpha-free via opencode)
+
+The same workload against opencode's free endpoint (which *does* enable
+automatic prefix caching):
+
+| Config | Req | L1 hit | Upstream | Hit rate | Cached-token ratio | P50 (ms) | $ saved |
+|---|---|---|---|---|---|---|---|
+| baseline | 60 | 0 | 60 | 0% | 53% | 7498.1 | $0.000000 |
+| fusion | 60 | 40 | 20 | 67% | 53% | 0.2 | $0.000273 |
+
+- Every request also benefits from the upstream's own prefix cache
+  (cached-token ratio 53%) — fusion-cache captures this and reports it as
+  money saved via `prompt_cache_hit_tokens` / `cached_tokens` accounting.
 - P95 stays high (~11 s) because the 20 cold misses still hit the slow
-  upstream — caching accelerates hits, it can't fix upstream latency.
+  free upstream.
 
 ### Paraphrase workload — the L2 semantic layer's payoff
 
