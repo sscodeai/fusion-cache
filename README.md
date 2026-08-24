@@ -206,9 +206,23 @@ Environment variables:
 | Var | Default | Purpose |
 |---|---|---|
 | `FUSION_UPSTREAM_BASE_URL` | `https://api.deepseek.com` | upstream base URL |
-| `FUSION_UPSTREAM_API_KEY` / `DEEPSEEK_API_KEY` | — | upstream API key |
+| `FUSION_UPSTREAM_PROVIDER` | `openai` | `openai` (any OpenAI-compatible endpoint) or `anthropic` |
+| `FUSION_UPSTREAM_API_KEY` / `DEEPSEEK_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — | upstream credentials (provider-dependent) |
+| `FUSION_GATEWAY_API_KEY` | — | if set, require `Authorization: Bearer <key>` on `/v1/*` (health/metrics/dashboard stay open) |
+| `FUSION_CORS_ORIGINS` | — | comma-separated allowed origins (e.g. `https://app.example.com,https://admin.example.com`) |
+| `FUSION_UPSTREAM_RETRIES` | `2` | max retries on upstream 429 (exponential backoff) |
 | `REDIS_URL` | — | enable RedisStore (else in-memory) |
 | `FUSION_HOST` / `FUSION_PORT` | `0.0.0.0` / `8000` | bind address |
+
+### Provider support
+
+- **`openai`** (default): any OpenAI-compatible endpoint — DeepSeek, OpenAI,
+  OpenRouter, local vLLM/Ollama, etc. Just point `FUSION_UPSTREAM_BASE_URL` at it.
+- **`anthropic`**: set `FUSION_UPSTREAM_PROVIDER=anthropic`. The gateway
+  translates the request to `/v1/messages` with `x-api-key` auth and normalizes
+  the response back to the OpenAI shape. Note: Anthropic does not expose
+  DeepSeek-style `prompt_cache_hit_tokens`, so L3 prefix accounting reports 0
+  for this provider (honest — no discount to count).
 
 ### Endpoints
 
