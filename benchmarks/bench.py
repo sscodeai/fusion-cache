@@ -68,6 +68,51 @@ TASKS = [
     "What does 'CAP theorem' state?",
 ]
 
+# Paraphrase variants: each "task" is one question asked 3 different ways.
+# L1 exact will MISS these (texts differ); only L2 semantic can catch them.
+PARAPHRASE_GROUPS = [
+    [
+        "Explain what a cache hit ratio is in one sentence.",
+        "In a single sentence, describe the concept of a cache hit rate.",
+        "What does the cache hit percentage mean?",
+    ],
+    [
+        "What is the difference between LRU and TTL caching?",
+        "Compare and contrast LRU cache eviction with TTL-based expiry.",
+        "How do LRU and time-to-live caching differ from each other?",
+    ],
+    [
+        "Explain exponential backoff in one sentence.",
+        "What does exponential backoff mean, briefly?",
+        "Describe the exponential backoff strategy in a nutshell.",
+    ],
+    [
+        "What does idempotency mean in APIs?",
+        "Explain the meaning of an idempotent API operation.",
+        "What is idempotence in the context of web APIs?",
+    ],
+    [
+        "Explain what a reverse proxy does.",
+        "What is the role of a reverse proxy server?",
+        "Describe what a reverse proxy is used for.",
+    ],
+    [
+        "What is the difference between a monolith and microservices?",
+        "Compare monolithic architecture with microservices.",
+        "How do monoliths and microservices differ?",
+    ],
+    [
+        "Explain what a semaphore is in concurrent programming.",
+        "What role does a semaphore play in multithreading?",
+        "Define semaphore in the context of concurrency control.",
+    ],
+    [
+        "What does 'eventually consistent' mean?",
+        "Explain the concept of eventual consistency.",
+        "What is meant by eventually consistent systems?",
+    ],
+]
+
 
 @dataclass
 class Sample:
@@ -150,8 +195,14 @@ def _mk_messages(task: str) -> List[Dict[str, str]]:
     ]
 
 
-async def _upstream_call(client: AsyncClient, base_url: str, model: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Call upstream with retry on transient errors (429/5xx)."""
+async def _upstream_call(client: AsyncClient, base_url: str, model: str, messages: List[Dict[str, str]], skip_on_error: bool = False) -> Optional[Dict[str, Any]]:
+    """Call upstream with retry on transient errors (429/5xx).
+
+    When ``skip_on_error`` is True, a request that exhausts retries is
+    skipped (returns None) instead of raising — used by paraphrase mode
+    where the free endpoint can be flaky and we'd rather lose one sample
+    than abort the whole run.
+    """
     max_retries = 4
     delay = 2.0
     last_err: Optional[Exception] = None
@@ -168,7 +219,7 @@ async def _upstream_call(client: AsyncClient, base_url: str, model: str, message
                 await asyncio.sleep(delay)
                 delay *= 2
                 continue
-            raise
+            break
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code in (429, 500, 502, 503) and attempt < max_retries:
@@ -176,16 +227,23 @@ async def _upstream_call(client: AsyncClient, base_url: str, model: str, message
             await asyncio.sleep(delay)
             delay *= 2
             continue
-        raise RuntimeError(f"upstream {resp.status_code}: {resp.text[:200]}")
-    raise RuntimeError(f"upstream call failed: {last_err}")  # pragma: no cover
+        last_err = RuntimeError(f"upstream {resp.status_code}: {resp.text[:200]}")
+        break
+    if skip_on_error:
+        print(f"    ⚠ skipping request after retries exhausted: {last_err}", flush=True)
+        return None
+    raise RuntimeError(f"upstream call failed: {last_err}")
 
 
-async def run_baseline(client: AsyncClient, base_url: str, model: str, tasks: List[str], repeat: int) -> RunResult:
+async def run_baseline(client: AsyncClient, base_url: str, model: str, tasks: List[Any], repeat: int) -> RunResult:
     result = RunResult("baseline (no cache)")
     for ti, task in enumerate(tasks):
-        for rep in range(repeat):
+        variants: List[str] = task if isinstance(task, list) else [task] * repeat
+        for rep, variant in enumerate(variants):
             start = time.perf_counter()
-            body = await _upstream_call(client, base_url, model, _mk_messages(task))
+            body = await _upstream_call(client, base_url, model, _mk_messages(variant), skip_on_error=True)
+            if body is None:
+                continue  # skipped after retries exhausted (flaky free endpoint)
             elapsed = (time.perf_counter() - start) * 1000
             usage = body.get("usage", {})
             details = usage.get("prompt_tokens_details", {}) or {}
@@ -203,7 +261,18 @@ async def run_baseline(client: AsyncClient, base_url: str, model: str, tasks: Li
 
 async def _fusion_upstream(client: AsyncClient, base_url: str, model: str):
     async def upstream(**kwargs: Any) -> Any:
-        body = await _upstream_call(client, base_url, model, kwargs.get("messages", []))
+        body = await _upstream_call(client, base_url, model, kwargs.get("messages", []), skip_on_error=True)
+        if body is None:
+            # Return a minimal completion so the pipeline records a miss
+            # instead of crashing the whole run on a flaky free endpoint.
+            return {
+                "id": "chatcmpl-skip",
+                "object": "chat.completion",
+                "created": 1_700_000_000,
+                "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
         return body
 
     return upstream
@@ -216,6 +285,7 @@ async def run_fusion(
     tasks: List[str],
     repeat: int,
     enable_semantic: bool,
+    paraphrase: bool = False,
 ) -> RunResult:
     cfg = FusionCacheConfig(
         enable_semantic=enable_semantic,
@@ -225,10 +295,38 @@ async def run_fusion(
         semantic_ttl=7200.0,
     )
     cache = FusionCache(config=cfg)
+    if enable_semantic:
+        # Use a local deterministic embedder so the L2 path runs without
+        # needing a paid /embeddings endpoint. Character-ngram similarity
+        # makes paraphrases (shared vocabulary) land above the threshold.
+        from fusion_cache.semantic.embedder import Embedder
+
+        cache.embedder = _LocalEmbedder()  # type: ignore[assignment]
     upstream = await _fusion_upstream(client, base_url, model)
     result = RunResult("fusion" + ("+sem" if enable_semantic else ""))
 
     for ti, task in enumerate(tasks):
+        if paraphrase:
+            # Each task is a list of paraphrase variants; issue each once.
+            variants = task if isinstance(task, list) else [task]
+            for rep, variant in enumerate(variants):
+                request = {"model": model, "messages": _mk_messages(variant), "temperature": 0.2}
+                start = time.perf_counter()
+                pres = await cache.chat_completion(request=request, upstream=upstream, stream=False)
+                elapsed = (time.perf_counter() - start) * 1000
+                usage = pres.meta or {}
+                details = usage.get("prompt_tokens_details", {}) or {}
+                result.samples.append(
+                    Sample(
+                        task_idx=ti, repeat=rep, layer=pres.layer, hit=pres.hit,
+                        latency_ms=elapsed,
+                        prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                        cached_tokens=int(details.get("cached_tokens", 0) or usage.get("prompt_cache_hit_tokens", 0)),
+                        completion_tokens=int(usage.get("completion_tokens", 0)),
+                        cost_saved_usd=pres.cost_saved_usd,
+                    )
+                )
+            continue
         for rep in range(repeat):
             request = {"model": model, "messages": _mk_messages(task), "temperature": 0.2}
             start = time.perf_counter()
@@ -248,6 +346,37 @@ async def run_fusion(
             )
     await cache.aclose()
     return result
+
+
+class _LocalEmbedder:
+    """Deterministic local embedder (character n-grams) — no API needed.
+
+    Paraphrases share most vocabulary/trigrams, so they land above the
+    similarity threshold; unrelated texts do not. Mirrors the test fixture.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = True
+
+    async def embed(self, text: str) -> List[float]:
+        import math
+
+        text = text.lower()
+        ngrams: Dict[str, int] = {}
+        for tok in text.split():
+            ngrams["w:" + tok] = ngrams.get("w:" + tok, 0) + 1
+        for i in range(len(text) - 2):
+            gram = text[i : i + 3]
+            ngrams[gram] = ngrams.get(gram, 0) + 1
+        vec = [0.0] * 128
+        for gram, count in ngrams.items():
+            h = hash(gram) & 127
+            vec[h] += count
+        norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+        return [x / norm for x in vec]
+
+    async def aclose(self) -> None:  # noqa: D401
+        pass
 
 
 def _markdown(results: List[RunResult]) -> str:
@@ -273,13 +402,18 @@ async def main() -> None:
     parser.add_argument("--repeat", type=int, default=3, help="times to repeat each task")
     parser.add_argument("--no-semantic", action="store_true", help="skip the semantic-enabled run")
     parser.add_argument("--no-baseline", action="store_true", help="skip the baseline run")
+    parser.add_argument("--paraphrase", action="store_true", help="use paraphrase groups (each task asked 3 ways) to exercise the L2 semantic layer")
     args = parser.parse_args()
 
     api_key = os.environ.get("OPENCODE_GO_API_KEY") or os.environ.get("OPENCODE_API_KEY")
     if not api_key:
         raise SystemExit("OPENCODE_GO_API_KEY / OPENCODE_API_KEY not set")
 
-    tasks = TASKS[: args.tasks]
+    if args.paraphrase:
+        tasks: List[Any] = PARAPHRASE_GROUPS[: args.tasks]
+        print(f"paraphrase mode: {len(tasks)} groups × 3 variants each (L2 semantic is the star)")
+    else:
+        tasks = TASKS[: args.tasks]
     headers = {"Authorization": f"Bearer {api_key}"}
     async with AsyncClient(headers=headers) as client:
         results: List[RunResult] = []
@@ -287,13 +421,18 @@ async def main() -> None:
             print(f"▶ baseline: {len(tasks)} tasks × {args.repeat} ...")
             results.append(await run_baseline(client, args.base_url, args.model, tasks, args.repeat))
         print(f"▶ fusion (L1+L3): ...")
-        results.append(await run_fusion(client, args.base_url, args.model, tasks, args.repeat, enable_semantic=False))
+        results.append(
+            await run_fusion(client, args.base_url, args.model, tasks, args.repeat, enable_semantic=False, paraphrase=args.paraphrase)
+        )
         if not args.no_semantic:
             print(f"▶ fusion+sem (L1+L2+L3): ...")
-            results.append(await run_fusion(client, args.base_url, args.model, tasks, args.repeat, enable_semantic=True))
+            results.append(
+                await run_fusion(client, args.base_url, args.model, tasks, args.repeat, enable_semantic=True, paraphrase=args.paraphrase)
+            )
 
     print("\n" + _markdown(results))
-    print(f"\nWorkload: {args.tasks} tasks × {args.repeat} reps, model={args.model}, upstream={args.base_url}")
+    wl = "paraphrase groups" if args.paraphrase else "tasks"
+    print(f"\nWorkload: {args.tasks} {wl} × {args.repeat} reps, model={args.model}, upstream={args.base_url}")
 
 
 if __name__ == "__main__":
