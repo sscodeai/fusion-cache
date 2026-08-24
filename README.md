@@ -285,19 +285,41 @@ ships fusion + DeepSeek accounting as a general middleware. See
 
 ---
 
-## Benchmark methodology
+## Benchmark
 
-The benchmark targets in the decision doc (`.00 → .18` USD/task, P95
-4.2s → 1.7s) are **targets the bench script must reproduce**, not yet-measured
-numbers. Reproducing them requires a real DeepSeek key; the MVP test suite
-runs against a fake OpenAI server instead.
+**Real end-to-end benchmark** against `ox-alpha-free` (opencode.ai Console Go
+endpoint, free tier) — 20 distinct tasks × 3 reps each (60 requests per
+config), shared system prompt, `temperature=0.2`, `stream=False`. Run with
+`python benchmarks/bench.py` (add your opencode/DeepSeek key as
+`OPENCODE_GO_API_KEY` / `DEEPSEEK_API_KEY`).
 
-Methodology (when a key is available):
+| Config | Req | L1 hit | L2 hit | Upstream | Prefix-hit reqs | Hit rate | Cached-token ratio | P50 (ms) | P95 (ms) | $ saved |
+|---|---|---|---|---|---|---|---|---|---|---|
+| baseline (no cache) | 60 | 0 | 0 | 60 | 60 | 0% | 53% | 7498.1 | 11783.8 | $0.000000 |
+| fusion | 60 | 40 | 0 | 20 | 60 | 67% | 53% | 0.2 | 11436.4 | $0.000273 |
+| fusion+sem | 60 | 40 | 0 | 20 | 60 | 67% | 53% | 0.2 | 11981.5 | $0.000273 |
+
+What this shows:
+
+- **67% of requests are served from the L1 exact cache** (0.2 ms median —
+  ~37,000× faster than the 7.5 s upstream median), with only 20/60 upstream
+  calls.
+- **Every request also benefits from the upstream's own prefix cache**
+  (`cached-token ratio 53%`) — fusion-cache captures and reports this as money
+  saved via `prompt_cache_hit_tokens` / `cached_tokens` accounting.
+- **L2 semantic adds nothing here** because the workload repeats identical
+  prompts (L1 already catches them); it pays off on paraphrase-heavy
+  workloads. The benchmark script ships with both modes.
+- P95 stays high (~11 s) because the 20 cold misses still hit the slow
+  upstream — caching accelerates hits, it can't fix upstream latency.
+
+### Methodology
 
 1. **Workload:** N distinct tasks with shared system prompt + stable
    prompt-first layout, issued 3× each interleaved (warm/cold cache mix).
-2. **Upstream:** DeepSeek `deepseek-chat`, pinned model + `temperature=0.2`,
-   `stream=False`; no other middleware in the path.
+2. **Upstream:** any OpenAI-compatible endpoint (default `ox-alpha-free` on
+   opencode.ai/zen/go/v1); pinned model + `temperature=0.2`, `stream=False`;
+   no other middleware in the path.
 3. **Warm vs cold:** cold = first run on an empty cache; warm = subsequent runs.
 4. **Metrics:** exact/semantic/prefix hit counts, hit rate, per-request
    latency (P50/P95) and cost; cost = `sum(prompt_cache_miss_tokens × miss
@@ -308,7 +330,10 @@ Methodology (when a key is available):
    layer.
 
 Honest claims only: L3 savings are real upstream discounts (usage fields are
-provider-returned); L1/L2 savings are upstream calls avoided.
+provider-returned); L1/L2 savings are upstream calls avoided. The original
+decision-doc targets (`.00 → .18` USD/task, P95 4.2s → 1.7s) were goals for
+this script to reproduce — actual numbers depend on the upstream's pricing
+and latency; the framework-agnostic script lets you measure your own.
 
 ---
 
