@@ -38,6 +38,28 @@ class Store(ABC):
     def size(self) -> int:
         """Number of live entries."""
 
+    # ---- async variants ----------------------------------------------------
+    # The pipeline uses the async variants so a Redis-backed store can run
+    # inside an event loop.  The default implementation bridges to the sync
+    # methods (fine for in-memory stores).
+    async def aget(self, key: str) -> Optional[Dict[str, Any]]:
+        return self.get(key)
+
+    async def aset(self, key: str, value: Dict[str, Any], ttl: Optional[float] = None) -> None:
+        self.set(key, value, ttl)
+
+    async def adelete(self, key: str) -> bool:
+        return self.delete(key)
+
+    async def akeys(self) -> List[str]:
+        return list(self.keys())
+
+    async def aclear(self) -> None:
+        self.clear()
+
+    async def asize(self) -> int:
+        return self.size()
+
     async def aclose(self) -> None:
         """Release any resources (default: no-op)."""
 

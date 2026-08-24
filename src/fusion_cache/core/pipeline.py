@@ -36,6 +36,7 @@ from ..semantic.embedder import Embedder
 from ..semantic.matcher import SemanticMatcher
 from ..stores.base import Store
 from ..stores.memory import MemoryStore
+from .breaker import CircuitBreaker
 from .key import request_hash
 from .replay import astream
 
@@ -91,25 +92,27 @@ class FusionCacheStats:
     requests: int = 0
     exact_hits: int = 0
     semantic_hits: int = 0
+    shared_hits: int = 0
     prefix_hits: int = 0
     misses: int = 0
     cost_saved_usd: float = 0.0
 
     def hit_rate(self) -> float:
-        """Fraction of requests served without calling upstream (L1+L2).
+        """Fraction of requests served without calling upstream (L1+L2+shared).
 
         L3 prefix hits are upstream-side discounts, reported separately via
         ``prefix_hits`` and ``cost_saved_usd``.
         """
         if self.requests == 0:
             return 0.0
-        return (self.exact_hits + self.semantic_hits) / self.requests
+        return (self.exact_hits + self.semantic_hits + self.shared_hits) / self.requests
 
     def as_dict(self) -> Dict[str, Any]:
         return {
             "requests": self.requests,
             "exact_hits": self.exact_hits,
             "semantic_hits": self.semantic_hits,
+            "shared_hits": self.shared_hits,
             "prefix_hits": self.prefix_hits,
             "misses": self.misses,
             "cost_saved_usd": self.cost_saved_usd,
@@ -145,9 +148,16 @@ class FusionCache:
         self.embedder = embedder or Embedder(self.config.embedder)
         self.metrics = metrics or MetricsRegistry()
         self.matcher = SemanticMatcher(self.config)
+        self.breaker = CircuitBreaker(
+            failure_threshold=self.config.circuit_breaker_failure_threshold,
+            cooldown_s=self.config.circuit_breaker_cooldown_s,
+            enabled=self.config.circuit_breaker_enabled,
+        )
         self._embed_sem = asyncio.Semaphore(max_concurrent_embeds)
         self._stats = FusionCacheStats()
         self._stats_lock = asyncio.Lock()
+        self._inflight: Dict[str, "asyncio.Future[Any]"] = {}
+        self._inflight_lock = asyncio.Lock()
         self._closed = False
 
     # ------------------------------------------------------------------ stats
@@ -165,6 +175,8 @@ class FusionCache:
                 self._stats.exact_hits += 1
             elif result.layer == "semantic":
                 self._stats.semantic_hits += 1
+            elif result.layer == "shared":
+                self._stats.shared_hits += 1
             else:
                 self._stats.misses += 1
                 if result.prefix_hit:
@@ -175,8 +187,8 @@ class FusionCache:
     def _exact_key(self, request: Mapping[str, Any]) -> str:
         return request_hash(request)
 
-    def _exact_get(self, key: str) -> Optional[Dict[str, Any]]:
-        return self.store.get(key)
+    async def _exact_get(self, key: str) -> Optional[Dict[str, Any]]:
+        return await self.store.aget(key)
 
     # ------------------------------------------------------------- L2 helpers
     async def _embed(self, text: str) -> list[float]:
@@ -185,8 +197,8 @@ class FusionCache:
 
     async def _semantic_search(self, query_embedding: list[float], request: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         entries = []
-        for entry_key in self.semantic_store.keys():
-            entry = self.semantic_store.get(entry_key)
+        for entry_key in await self.semantic_store.akeys():
+            entry = await self.semantic_store.aget(entry_key)
             if entry is not None and "embedding" in entry:
                 entries.append(entry)
         return self.matcher.best_match(query_embedding, entries, request=request)
@@ -214,7 +226,7 @@ class FusionCache:
 
         # ---- L1 exact -----------------------------------------------------
         if self.config.enable_exact:
-            cached = self._exact_get(key)
+            cached = await self._exact_get(key)
             if cached is not None:
                 result.layer = "exact"
                 result.hit = True
@@ -250,16 +262,82 @@ class FusionCache:
                 self.metrics.record("semantic", hit=False, reason="embed_error")
 
         # ---- L3 miss → upstream ----------------------------------------------
-        try:
-            upstream_result = upstream(**req)
-            if inspect.isawaitable(upstream_result):
-                upstream_obj = await upstream_result
-            else:
-                upstream_obj = upstream_result
-        except Exception:
-            self.metrics.record("miss", hit=False, reason="upstream_error")
-            raise
+        # Circuit breaker: if upstream is failing, serve cache hits normally
+        # but fail fast on requests that would need a fresh upstream call.
+        if self.config.circuit_breaker_enabled and not self.breaker.allow_request():
+            result.layer = "miss"
+            result.hit = False
+            result.cached = False
+            result.latency_ms = (time.perf_counter() - started) * 1000
+            self.metrics.record("miss", hit=False, reason="circuit_open")
+            await self._record(result)
+            raise RuntimeError("upstream circuit breaker open; cache miss cannot be served")
 
+        # Single-flight: concurrent requests for the SAME key share one
+        # upstream call (prevents cache stampede on cold keys).  The future
+        # carries the upstream response object; waiters continue processing
+        # with that response (cache fill is idempotent).
+        # Check + claim must be atomic under the lock, otherwise concurrent
+        # requests all see "no in-flight" and stampede upstream.
+        fut: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
+        async with self._inflight_lock:
+            existing = self._inflight.get(key)
+            if existing is not None:
+                pass  # handled below, outside the lock (await can't hold the lock)
+            else:
+                self._inflight[key] = fut
+        if existing is not None:
+            try:
+                upstream_obj = await existing
+            except Exception:
+                # The fetching request failed and will clean up the map in its
+                # finally block; we simply retry the whole flow by falling
+                # through to claim a fresh future below.
+                upstream_obj = None
+            if upstream_obj is not None:
+                fut_result = upstream_obj
+                # Shared result from another in-flight request: this
+                # request did NOT call upstream.  Mark it as a hit so
+                # stats reflect reality (no upstream spend).
+                return await self._process_shared_response(key, req, fut_result, result, stream, started)
+            # Fetching request failed; claim our own future.
+            fut = asyncio.get_running_loop().create_future()
+            async with self._inflight_lock:
+                # Only claim if no one else already did while we awaited.
+                self._inflight.setdefault(key, fut)
+        try:
+            try:
+                upstream_result = upstream(**req)
+                if inspect.isawaitable(upstream_result):
+                    upstream_obj = await upstream_result
+                else:
+                    upstream_obj = upstream_result
+            except Exception as exc:
+                self.metrics.record("miss", hit=False, reason="upstream_error")
+                if self.config.circuit_breaker_enabled:
+                    self.breaker.record_failure()
+                fut.set_exception(exc)
+                raise
+            if self.config.circuit_breaker_enabled:
+                self.breaker.record_success()
+            fut.set_result(upstream_obj)
+        finally:
+            async with self._inflight_lock:
+                self._inflight.pop(key, None)
+
+        return await self._process_response(key, req, upstream_obj, result, stream, started)
+
+    # ------------------------------------------------------------- helpers
+    async def _process_response(
+        self,
+        key: str,
+        req: Mapping[str, Any],
+        upstream_obj: Any,
+        result: PipelineResult,
+        stream: bool,
+        started: float,
+    ) -> PipelineResult:
+        """Process an upstream response: buffer/parse, account L3, fill caches, record metrics."""
         # "miss" from our perspective: we called upstream.  L3 prefix
         # accounting is expressed via cost_saved_usd and the "prefix" metric
         # layer (upstream prefix-cache hits), not as a cache hit.
@@ -296,7 +374,7 @@ class FusionCache:
 
         # ---- populate caches ------------------------------------------------
         if self.config.enable_exact:
-            self.store.set(
+            await self.store.aset(
                 key,
                 {"response": result.response, "meta": result.meta, "stream": bool(stream)},
                 ttl=self.config.exact_ttl,
@@ -304,7 +382,7 @@ class FusionCache:
         if self.config.enable_semantic and self.embedder.enabled and not stream:
             try:
                 emb = await self._embed(self._embed_text(req))
-                self.semantic_store.set(
+                await self.semantic_store.aset(
                     f"sem:{key}",
                     {
                         "key": key,
@@ -327,6 +405,64 @@ class FusionCache:
         )
         if result.upstream_hit_tokens:
             self.metrics.record("prefix", hit=True, tokens=result.upstream_hit_tokens)
+        await self._record(result)
+        return result
+
+    async def _process_shared_response(
+        self,
+        key: str,
+        req: Mapping[str, Any],
+        upstream_obj: Any,
+        result: PipelineResult,
+        stream: bool,
+        started: float,
+    ) -> PipelineResult:
+        """Process a response shared from another in-flight request (single-flight).
+
+        This request did NOT call upstream — another request did and we
+        piggybacked on its result.  Marked as a *shared hit* (layer="shared",
+        hit=True) so stats reflect that no upstream spend happened here.
+        """
+        result.layer = "shared"
+        result.hit = True
+        result.cached = True
+        result.hit_key = key
+
+        if stream:
+            chunks: list[Any] = []
+            usage: Dict[str, Any] = {}
+            async for chunk in astream(upstream_obj):
+                chunks.append(chunk)
+                u = _extract_usage(chunk)
+                if u:
+                    usage = u
+            if not chunks:
+                raise RuntimeError("upstream returned an empty stream")
+            result.response = BufferedStream(chunks=chunks, usage=usage)
+            result.meta = dict(usage)
+        else:
+            result.response = upstream_obj
+            u = _extract_usage(upstream_obj)
+            result.meta = dict(u) if u else {}
+
+        breakdown = UsageBreakdown.from_dict(result.meta)
+        result.upstream_hit_tokens = breakdown.prompt_cache_hit_tokens
+        result.upstream_miss_tokens = breakdown.prompt_cache_miss_tokens
+        result.upstream_total_tokens = breakdown.total_tokens
+        result.cost_saved_usd = account_prefix_costs(breakdown, self.config.price_model).saved_usd
+        result.latency_ms = (time.perf_counter() - started) * 1000.0
+
+        # Fill caches idempotently (the first request may have already done so).
+        if self.config.enable_exact:
+            await self.store.aset(
+                key,
+                {"response": result.response, "meta": result.meta, "stream": bool(stream)},
+                ttl=self.config.exact_ttl,
+            )
+        self.metrics.record(
+            "shared", hit=True, latency_ms=result.latency_ms,
+            cost_saved_usd=result.cost_saved_usd, tokens=result.upstream_hit_tokens,
+        )
         await self._record(result)
         return result
 
