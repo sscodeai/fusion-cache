@@ -266,7 +266,28 @@ docker compose up --build
 fusion-cache serve --port 8000            # start gateway
 fusion-cache stats --url http://localhost:8000   # print cache stats
 fusion-cache check                        # environment health check
+fusion-cache-mcp                          # MCP server (stdio) for agents
 ```
+
+### Agent integration (MCP + gateway)
+
+fusion-cache works with AI coding agents (pi, Claude Code, opencode, Cursor)
+in two channels:
+
+- **Gateway**: point the agent's `OPENAI_BASE_URL` at the gateway — all LLM
+  traffic flows through the cache. Zero code changes.
+- **MCP server**: `fusion-cache-mcp` exposes tools (`cache_stats`,
+  `cache_invalidate`, `cache_status`, `cache_config`) so the agent can see
+  and manage the cache.
+
+```bash
+pip install "fusion-cache[mcp]"
+fusion-cache-mcp     # register with Claude Code via .mcp.json, etc.
+```
+
+See [docs/agent-integration.md](docs/agent-integration.md) for per-agent
+setup. Try [examples/quickstart.py](examples/quickstart.py) for a 30-second
+before/after demo.
 
 ---
 
