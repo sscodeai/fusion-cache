@@ -9,14 +9,24 @@ before (optionally) hitting the real upstream.  It also exposes:
 - ``GET /dashboard``      — self-contained HTML dashboard (inline CSS/JS, no CDN)
 - ``GET /health``         — liveness probe
 
-Upstream is configured with ``FUSION_UPSTREAM_BASE_URL`` (default
-``https://api.deepseek.com``).  The cache uses a ``RedisStore`` when
-``REDIS_URL`` is set, otherwise an in-memory ``MemoryStore``.
+Configuration (env vars):
+
+- ``FUSION_UPSTREAM_BASE_URL``   — upstream base URL (default https://api.deepseek.com)
+- ``FUSION_UPSTREAM_PROVIDER``   — ``openai`` (default, any OpenAI-compatible
+  endpoint) or ``anthropic``
+- ``FUSION_UPSTREAM_API_KEY`` / ``DEEPSEEK_API_KEY`` / ``OPENAI_API_KEY`` /
+  ``ANTHROPIC_API_KEY``          — upstream credentials (provider-dependent)
+- ``FUSION_GATEWAY_API_KEY``     — if set, require ``Authorization: Bearer <key>``
+  on all /v1/* requests (health/metrics/dashboard stay open)
+- ``FUSION_CORS_ORIGINS``        — comma-separated allowed origins (default: none)
+- ``REDIS_URL``                  — if set, use RedisStore (else in-memory)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import time
 from typing import Any, AsyncIterator, Dict, Optional
@@ -26,9 +36,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 from fusion_cache.config import FusionCacheConfig
 from fusion_cache.core.pipeline import FusionCache
+from fusion_cache.gateway.upstream import call_upstream_nonstream, call_upstream_stream
 from fusion_cache.stores.redis import RedisStore
 
+logger = logging.getLogger("fusion_cache.gateway")
+
 DEFAULT_UPSTREAM = os.environ.get("FUSION_UPSTREAM_BASE_URL", "https://api.deepseek.com")
+DEFAULT_PROVIDER = os.environ.get("FUSION_UPSTREAM_PROVIDER", "openai")
 
 
 def _build_cache() -> FusionCache:
@@ -41,39 +55,89 @@ def _build_cache() -> FusionCache:
     return FusionCache(config=cfg, store=store)
 
 
-def create_app(cache: Optional[FusionCache] = None, upstream_base_url: Optional[str] = None) -> FastAPI:
+def _gateway_api_key() -> Optional[str]:
+    key = os.environ.get("FUSION_GATEWAY_API_KEY", "")
+    return key or None
+
+
+def _cors_origins() -> list[str]:
+    raw = os.environ.get("FUSION_CORS_ORIGINS", "")
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def create_app(
+    cache: Optional[FusionCache] = None,
+    upstream_base_url: Optional[str] = None,
+    provider: Optional[str] = None,
+    gateway_api_key: Optional[str] = None,
+    cors_origins: Optional[list[str]] = None,
+) -> FastAPI:
     """Create the FastAPI application.
 
-    ``cache`` and ``upstream_base_url`` are injectable for tests; defaults
-    build from the environment.
+    All parameters are injectable for tests; defaults build from the
+    environment.
     """
     app = FastAPI(title="fusion-cache gateway", version="0.1.0")
     app.state.cache = cache or _build_cache()
     app.state.upstream_base_url = (upstream_base_url or DEFAULT_UPSTREAM).rstrip("/")
+    app.state.provider = provider or DEFAULT_PROVIDER
+    app.state.gateway_api_key = gateway_api_key if gateway_api_key is not None else _gateway_api_key()
+    origins = cors_origins if cors_origins is not None else _cors_origins()
 
+    # ---- middleware: CORS -------------------------------------------------
+    if origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    # ---- auth dependency ---------------------------------------------------
+    def _check_auth(request: Request) -> Optional[JSONResponse]:
+        key = app.state.gateway_api_key
+        if not key:
+            return None
+        auth = request.headers.get("authorization", "")
+        expected = f"Bearer {key}"
+        if auth == expected:
+            return None
+        return JSONResponse(status_code=401, content={"error": {"message": "invalid or missing API key"}})
+
+    # ---- routes ------------------------------------------------------------
     @app.get("/health")
     async def health() -> Dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/v1/models")
-    async def list_models() -> Dict[str, Any]:
-        """Passthrough to the upstream models endpoint (best effort)."""
-        upstream = app.state.upstream_base_url
+    async def list_models(request: Request) -> Any:
+        auth_err = _check_auth(request)
+        if auth_err:
+            return auth_err
+        # Passthrough to the upstream models endpoint (best effort).
         from httpx import AsyncClient
 
         async with AsyncClient(timeout=30) as client:
             try:
-                resp = await client.get(f"{upstream}/models")
+                resp = await client.get(f"{app.state.upstream_base_url}/models")
                 if resp.status_code == 200:
                     return resp.json()
             except Exception:
                 pass
-        # Fallback: advertise a reasonable default set without hitting the wire.
         return {"object": "list", "data": [{"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"}]}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
         cache: FusionCache = app.state.cache
+        start = time.perf_counter()
+
+        auth_err = _check_auth(request)
+        if auth_err:
+            return auth_err
+
         try:
             body = await request.json()
         except Exception:
@@ -82,68 +146,50 @@ def create_app(cache: Optional[FusionCache] = None, upstream_base_url: Optional[
         stream = bool(body.get("stream", False))
 
         async def upstream(**kwargs: Any) -> Any:
-            """Call the real upstream via httpx and return a JSON dict or an async chunk iterator."""
-            headers = {"Content-Type": "application/json"}
-            api_key = os.environ.get("FUSION_UPSTREAM_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            """Call the real upstream via the provider adapter."""
             if stream:
-                # The httpx client must outlive the generator: the pipeline
-                # consumes the stream AFTER this function returns, so the
-                # client is created inside the generator and closed when the
-                # generator finishes.
-                async def gen() -> AsyncIterator[Dict[str, Any]]:
-                    from httpx import AsyncClient
-
-                    async with AsyncClient(timeout=120) as client:
-                        async with client.stream(
-                            "POST",
-                            f"{app.state.upstream_base_url}/chat/completions",
-                            json=kwargs,
-                            headers=headers,
-                        ) as resp:
-                            if resp.status_code != 200:
-                                raise RuntimeError(f"upstream error {resp.status_code}")
-                            async for line in resp.aiter_lines():
-                                line = line.strip()
-                                if not line or not line.startswith("data:"):
-                                    continue
-                                payload = line[len("data:"):].strip()
-                                if payload == "[DONE]":
-                                    return
-                                try:
-                                    yield json.loads(payload)
-                                except json.JSONDecodeError:
-                                    continue
-
-                return gen()
-            from httpx import AsyncClient
-
-            async with AsyncClient(timeout=120) as client:
-                resp = await client.post(
-                    f"{app.state.upstream_base_url}/chat/completions",
-                    json=kwargs,
-                    headers=headers,
-                )
-                if resp.status_code != 200:
-                    raise RuntimeError(f"upstream error {resp.status_code}: {resp.text[:300]}")
-                return resp.json()
+                return await call_upstream_stream(app.state.provider, app.state.upstream_base_url, dict(kwargs))
+            # Retry on 429 (rate limit) with a small backoff.
+            max_retries = int(os.environ.get("FUSION_UPSTREAM_RETRIES", "2"))
+            delay = 0.5
+            last_exc: Optional[Exception] = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return await call_upstream_nonstream(
+                        app.state.provider, app.state.upstream_base_url, dict(kwargs)
+                    )
+                except RuntimeError as exc:
+                    last_exc = exc
+                    if "429" in str(exc) and attempt < max_retries:
+                        logger.warning("upstream 429, retrying in %.1fs (attempt %d)", delay, attempt + 1)
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        continue
+                    raise
+            if last_exc is None:  # pragma: no cover
+                raise RuntimeError("upstream call failed")
+            raise last_exc
 
         try:
             result = await cache.chat_completion(request=body, upstream=upstream, stream=stream)
         except Exception as exc:
+            logger.error("chat_completions failed: %s", exc)
             return JSONResponse(status_code=502, content={"error": {"message": f"upstream failure: {exc}"}})
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "chat_completions layer=%s hit=%s latency=%.1fms cost_saved=%.6f",
+            result.layer, result.hit, elapsed_ms, result.cost_saved_usd,
+        )
 
         if stream:
             async def sse() -> AsyncIterator[str]:
-                chunks = result.stream_chunks
-                for chunk in chunks:
+                for chunk in result.stream_chunks:
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(sse(), media_type="text/event-stream")
 
-        # Non-streaming: return the upstream-shaped JSON, augmented with cache metadata.
         payload = result.response if isinstance(result.response, dict) else _response_to_dict(result.response)
         payload = dict(payload)
         payload["_fusion_cache"] = {
@@ -152,7 +198,7 @@ def create_app(cache: Optional[FusionCache] = None, upstream_base_url: Optional[
             "cached": result.cached,
             "prefix_hit": result.prefix_hit,
             "cost_saved_usd": round(result.cost_saved_usd, 8),
-            "latency_ms": round(result.latency_ms, 2),
+            "latency_ms": round(elapsed_ms, 2),
         }
         return JSONResponse(content=payload)
 
@@ -210,7 +256,6 @@ def _response_to_dict(resp: Any) -> Dict[str, Any]:
         return resp.model_dump()
     if isinstance(resp, dict):
         return resp
-    # Fall back to a minimal envelope.
     return {"object": "chat.completion", "choices": [], "usage": {}}
 
 
