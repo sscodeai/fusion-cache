@@ -1,0 +1,96 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "title": "Requests & Hit Rate",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(fusion_cache_requests_total[5m])",
+          "legendFormat": "req/s"
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "title": "Hit Rate",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "fusion_cache_hit_rate",
+          "legendFormat": "hit rate"
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "options": { "max": 1, "min": 0 }
+    },
+    {
+      "title": "Cost Saved",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "fusion_cache_cost_saved_usd_total",
+          "legendFormat": "USD saved"
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 }
+    },
+    {
+      "title": "Upstream Calls",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(fusion_cache_misses_total[5m])",
+          "legendFormat": "upstream calls/s"
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 }
+    },
+    {
+      "title": "Layer Hits (exact vs semantic)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(fusion_cache_exact_hits_total[5m])",
+          "legendFormat": "L1 exact"
+        },
+        {
+          "expr": "rate(fusion_cache_semantic_hits_total[5m])",
+          "legendFormat": "L2 semantic"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 }
+    },
+    {
+      "title": "Prefix-cache Hits (L3)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(fusion_cache_prefix_hits_total[5m])",
+          "legendFormat": "L3 prefix"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["llm", "cache"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "fusion-cache",
+  "uid": "fusion-cache-dashboard",
+  "version": 1
+}

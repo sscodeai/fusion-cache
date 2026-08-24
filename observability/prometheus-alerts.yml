@@ -1,0 +1,42 @@
+# Prometheus alerting rules for fusion-cache.
+# Scrape the gateway's /metrics endpoint (Prometheus format) and load these
+# rules. Adjust thresholds to your traffic.
+groups:
+  - name: fusion-cache
+    rules:
+      # Hit rate dropped below 50% over the last 5 minutes — something changed
+      # (upstream model swap, cache flushed, traffic pattern shift).
+      - alert: FusionCacheHitRateDrop
+        expr: |
+          rate(fusion_cache_exact_hits_total[5m])
+            + rate(fusion_cache_semantic_hits_total[5m])
+          < 0.5 * (rate(fusion_cache_requests_total[5m]) + 1)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "fusion-cache hit rate below 50%"
+          description: "Cache hit rate dropped — check upstream/model changes or cache flush."
+
+      # Requests all missing (no cache hits at all) — cache may be broken.
+      - alert: FusionCacheAllMisses
+        expr: |
+          rate(fusion_cache_requests_total[5m]) > 10
+            and rate(fusion_cache_misses_total[5m])
+              > 0.9 * rate(fusion_cache_requests_total[5m])
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "fusion-cache serving almost all requests as misses"
+          description: "Over 90% of requests are missing the cache — check store/Redis or key normalization."
+
+      # Cost saved trend going flat — cache not being populated.
+      - alert: FusionCacheNoSavings
+        expr: rate(fusion_cache_cost_saved_usd_total[10m]) <= 0
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "fusion-cache reporting no savings"
+          description: "No cost savings in the last 10 minutes — check if requests are all misses."
