@@ -1,16 +1,51 @@
-# fusion-cache
+<div align="center">
 
-Fusion cache for LLM APIs: **exact → semantic → prefix-cache accounting** in one
-framework-agnostic Python middleware layer. Drop-in wrapper for the OpenAI SDK,
-DeepSeek-first pricing model, honest money-saved metrics.
+# ⚡ fusion-cache
 
-> **Status:** v0.1.0 — production-ready core. Three-layer fusion cache
-> (exact → semantic → prefix accounting), OpenAI-compatible gateway
-> (auth, CORS, multi-provider, rate limiting), Redis shared cache,
-> circuit breaker with graceful degradation, single-flight (no cache
-> stampede), cache invalidation API, Prometheus metrics + Grafana dashboard
-> + alerting rules. See [DEPLOYMENT.md](DEPLOYMENT.md) for production
-> deployment.
+### Cut your LLM API costs by up to **97%** — and drop P95 latency from seconds to **0.7 ms**.
+
+A framework-agnostic caching layer for LLM APIs: **exact → semantic → prefix-cache
+accounting** in one drop-in middleware. Wrap your OpenAI client (or point your
+gateway at it) and repeated requests stop costing you money.
+
+**Measured on real workloads** (see [Benchmark](#benchmark)):
+
+| 🎯 97% hit rate | ⚡ 0.7 ms P95 | 💰 ~31× prefix discount | 🚀 16,000× faster hits |
+|---|---|---|---|
+| L1 exact + L2 semantic serve 58/60 requests from cache | vs 6.5 s uncached | DeepSeek cache-hit input tokens | P50 3.2 s → 0.1 ms |
+
+</div>
+
+---
+
+## ✨ What it does
+
+| Layer | Job | Cost of a hit |
+|---|---|---|
+| **L1 exact** | byte-identical requests → instant replay | ~0 ms |
+| **L2 semantic** | paraphrased requests → replay (guardrail-checked) | 1 embed call |
+| **L3 prefix** | *never a miss* — passes through and **accounts** the upstream prefix-cache discount (DeepSeek ~31×) | 0 extra calls |
+
+The pain: LLM API prices keep rising and your bill is mostly repeated compute.
+The fix: cache the repeats (L1/L2), and stop ignoring the prefix-cache discount
+your provider already gives you (L3) — then **show you the money saved**.
+
+```bash
+pip install fusion-cache
+```
+
+```python
+from fusion_cache import FusionCache
+from fusion_cache.wrapper.openai import CachedOpenAI
+import openai
+
+client = CachedOpenAI(openai.OpenAI(api_key=...), cache=FusionCache())
+# first call hits upstream, identical calls replay in ~0 ms
+```
+
+> **Want it in front of an AI agent (pi, Claude Code, opencode)?** Point its
+> `OPENAI_BASE_URL` at the gateway or add the MCP server — zero code changes.
+> See [Agent Integration](docs/agent-integration.md).
 
 ---
 
