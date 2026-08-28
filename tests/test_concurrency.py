@@ -113,6 +113,41 @@ async def test_concurrent_streaming_no_corruption():
     await cache.aclose()
 
 
+async def test_concurrent_same_key_streaming_single_upstream_call():
+    """Concurrent identical streams share buffered output, not the raw iterator."""
+    cfg = FusionCacheConfig(enable_semantic=False, circuit_breaker_enabled=False)
+    cache = FusionCache(config=cfg)
+    upstream_calls = {"n": 0}
+
+    async def stream_upstream(**kwargs: Any) -> Any:
+        upstream_calls["n"] += 1
+
+        async def gen():
+            await asyncio.sleep(0.001)
+            for i in range(5):
+                yield {"choices": [{"delta": {"content": f"c{i}"}}]}
+            yield {"usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}}
+
+        return gen()
+
+    request = {"model": "m", "messages": [{"role": "user", "content": "same stream"}]}
+    results = await asyncio.gather(
+        *(cache.chat_completion(request=request, upstream=stream_upstream, stream=True) for _ in range(50))
+    )
+    await cache.aclose()
+
+    assert upstream_calls["n"] == 1
+    assert results[0].layer == "miss"
+    assert all(r.layer in ("shared", "exact") for r in results[1:])
+    for r in results:
+        texts = [
+            c["choices"][0]["delta"].get("content", "")
+            for c in r.stream_chunks
+            if c.get("choices") and c["choices"][0].get("delta", {}).get("content")
+        ]
+        assert texts == [f"c{j}" for j in range(5)]
+
+
 async def test_metrics_thread_safe_under_load():
     """Metrics registry stays consistent under concurrent recording."""
     from fusion_cache.metrics.registry import MetricsRegistry

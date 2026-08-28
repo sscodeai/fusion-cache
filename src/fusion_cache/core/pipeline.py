@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
@@ -275,36 +276,30 @@ class FusionCache:
 
         # Single-flight: concurrent requests for the SAME key share one
         # upstream call (prevents cache stampede on cold keys).  The future
-        # carries the upstream response object; waiters continue processing
-        # with that response (cache fill is idempotent).
+        # carries the processed PipelineResult, so streaming waiters replay
+        # buffered chunks instead of racing to consume the same upstream stream.
         # Check + claim must be atomic under the lock, otherwise concurrent
         # requests all see "no in-flight" and stampede upstream.
-        fut: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
+        fut: "asyncio.Future[PipelineResult]" = asyncio.get_running_loop().create_future()
+        is_owner = False
         async with self._inflight_lock:
             existing = self._inflight.get(key)
             if existing is not None:
                 pass  # handled below, outside the lock (await can't hold the lock)
             else:
                 self._inflight[key] = fut
+                is_owner = True
         if existing is not None:
             try:
-                upstream_obj = await existing
+                shared_result = await existing
             except Exception:
-                # The fetching request failed and will clean up the map in its
-                # finally block; we simply retry the whole flow by falling
-                # through to claim a fresh future below.
-                upstream_obj = None
-            if upstream_obj is not None:
-                fut_result = upstream_obj
-                # Shared result from another in-flight request: this
-                # request did NOT call upstream.  Mark it as a hit so
-                # stats reflect reality (no upstream spend).
-                return await self._process_shared_response(key, req, fut_result, result, stream, started)
-            # Fetching request failed; claim our own future.
-            fut = asyncio.get_running_loop().create_future()
-            async with self._inflight_lock:
-                # Only claim if no one else already did while we awaited.
-                self._inflight.setdefault(key, fut)
+                return await self.chat_completion(request=request, upstream=upstream, stream=stream)
+            # Shared result from another in-flight request: this request did
+            # NOT call upstream.  Mark it as a hit so stats reflect reality.
+            return await self._process_shared_result(key, shared_result, result, started)
+        if not is_owner:  # pragma: no cover - defensive, lock branch above should decide ownership
+            return await self.chat_completion(request=request, upstream=upstream, stream=stream)
+
         try:
             try:
                 upstream_result = upstream(**req)
@@ -316,16 +311,18 @@ class FusionCache:
                 self.metrics.record("miss", hit=False, reason="upstream_error")
                 if self.config.circuit_breaker_enabled:
                     self.breaker.record_failure()
-                fut.set_exception(exc)
+                if not fut.done():
+                    fut.set_exception(exc)
                 raise
             if self.config.circuit_breaker_enabled:
                 self.breaker.record_success()
-            fut.set_result(upstream_obj)
+            processed = await self._process_response(key, req, upstream_obj, result, stream, started)
+            if not fut.done():
+                fut.set_result(processed)
+            return processed
         finally:
             async with self._inflight_lock:
                 self._inflight.pop(key, None)
-
-        return await self._process_response(key, req, upstream_obj, result, stream, started)
 
     # ------------------------------------------------------------- helpers
     async def _process_response(
@@ -408,16 +405,14 @@ class FusionCache:
         await self._record(result)
         return result
 
-    async def _process_shared_response(
+    async def _process_shared_result(
         self,
         key: str,
-        req: Mapping[str, Any],
-        upstream_obj: Any,
+        shared_result: PipelineResult,
         result: PipelineResult,
-        stream: bool,
         started: float,
     ) -> PipelineResult:
-        """Process a response shared from another in-flight request (single-flight).
+        """Convert a processed owner result into a per-request shared hit.
 
         This request did NOT call upstream — another request did and we
         piggybacked on its result.  Marked as a *shared hit* (layer="shared",
@@ -428,37 +423,23 @@ class FusionCache:
         result.cached = True
         result.hit_key = key
 
-        if stream:
-            chunks: list[Any] = []
-            usage: Dict[str, Any] = {}
-            async for chunk in astream(upstream_obj):
-                chunks.append(chunk)
-                u = _extract_usage(chunk)
-                if u:
-                    usage = u
-            if not chunks:
-                raise RuntimeError("upstream returned an empty stream")
-            result.response = BufferedStream(chunks=chunks, usage=usage)
-            result.meta = dict(usage)
+        if isinstance(shared_result.response, BufferedStream):
+            result.response = BufferedStream(
+                chunks=list(shared_result.response.chunks),
+                usage=dict(shared_result.response.usage),
+            )
+            result.meta = dict(shared_result.meta)
         else:
-            result.response = upstream_obj
-            u = _extract_usage(upstream_obj)
-            result.meta = dict(u) if u else {}
+            result.response = copy(shared_result.response)
+            result.meta = dict(shared_result.meta)
 
-        breakdown = UsageBreakdown.from_dict(result.meta)
-        result.upstream_hit_tokens = breakdown.prompt_cache_hit_tokens
-        result.upstream_miss_tokens = breakdown.prompt_cache_miss_tokens
-        result.upstream_total_tokens = breakdown.total_tokens
-        result.cost_saved_usd = account_prefix_costs(breakdown, self.config.price_model).saved_usd
+        result.upstream_hit_tokens = shared_result.upstream_hit_tokens
+        result.upstream_miss_tokens = shared_result.upstream_miss_tokens
+        result.upstream_total_tokens = shared_result.upstream_total_tokens
+        result.cost_saved_usd = shared_result.cost_saved_usd
+        result.prefix_hit = shared_result.prefix_hit
         result.latency_ms = (time.perf_counter() - started) * 1000.0
 
-        # Fill caches idempotently (the first request may have already done so).
-        if self.config.enable_exact:
-            await self.store.aset(
-                key,
-                {"response": result.response, "meta": result.meta, "stream": bool(stream)},
-                ttl=self.config.exact_ttl,
-            )
         self.metrics.record(
             "shared", hit=True, latency_ms=result.latency_ms,
             cost_saved_usd=result.cost_saved_usd, tokens=result.upstream_hit_tokens,
