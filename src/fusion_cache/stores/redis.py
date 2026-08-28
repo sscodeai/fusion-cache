@@ -56,10 +56,10 @@ class RedisStore(Store):
         raw = await self.client.get(self._k(key))
         if raw is None:
             return None
-        return json.loads(raw)
+        return _decode_value(json.loads(raw))
 
     async def aset(self, key: str, value: Dict[str, Any], ttl: Optional[float] = None) -> None:
-        raw = json.dumps(value, default=str)
+        raw = json.dumps(_encode_value(value), ensure_ascii=False)
         if ttl is not None and ttl > 0:
             await self.client.set(self._k(key), raw, ex=int(ttl))
         else:
@@ -133,3 +133,40 @@ def asyncio_get_event_loop():
         return asyncio.get_event_loop()
     except Exception:
         return None
+
+
+def _encode_value(value: Any) -> Any:
+    if _is_buffered_stream(value):
+        return {
+            "__fusion_cache_type__": "BufferedStream",
+            "chunks": _encode_value(value.chunks),
+            "usage": _encode_value(value.usage),
+        }
+    if hasattr(value, "model_dump"):
+        return _encode_value(value.model_dump(exclude_none=False))
+    if isinstance(value, dict):
+        return {str(k): _encode_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_value(v) for v in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _decode_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if value.get("__fusion_cache_type__") == "BufferedStream":
+            from fusion_cache.core.pipeline import BufferedStream
+
+            return BufferedStream(
+                chunks=_decode_value(value.get("chunks", [])),
+                usage=_decode_value(value.get("usage", {})),
+            )
+        return {k: _decode_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode_value(v) for v in value]
+    return value
+
+
+def _is_buffered_stream(value: Any) -> bool:
+    return value.__class__.__name__ == "BufferedStream" and hasattr(value, "chunks") and hasattr(value, "usage")

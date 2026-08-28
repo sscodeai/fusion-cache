@@ -11,8 +11,8 @@ from typing import Any, Dict
 import pytest
 
 from fusion_cache.config import FusionCacheConfig
-from fusion_cache.core.pipeline import FusionCache
-from fusion_cache.stores.redis import RedisStore
+from fusion_cache.core.pipeline import BufferedStream, FusionCache
+from fusion_cache.stores.redis import RedisStore, _decode_value, _encode_value
 
 REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6380/0")
 
@@ -20,6 +20,26 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("TEST_REDIS", "1") == "1",
     reason="Redis tests disabled",
 )
+
+
+def test_buffered_stream_serialization_roundtrip():
+    value = {
+        "response": BufferedStream(
+            chunks=[
+                {"choices": [{"delta": {"content": "Hi"}}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"total_tokens": 3}},
+            ],
+            usage={"total_tokens": 3},
+        ),
+        "meta": {"total_tokens": 3},
+        "stream": True,
+    }
+
+    decoded = _decode_value(_encode_value(value))
+
+    assert isinstance(decoded["response"], BufferedStream)
+    assert decoded["response"].chunks == value["response"].chunks
+    assert decoded["response"].usage == {"total_tokens": 3}
 
 
 def _redis_available() -> bool:
