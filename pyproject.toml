@@ -38,7 +38,7 @@ fusion-cache = "fusion_cache.cli:main"
 fusion-cache-mcp = "fusion_cache.mcp_server:main"
 
 [project.urls]
-Repository = "http://192.168.1.21:3000/dev/fusion-cache"
+Repository = "https://github.com/sscodeai/fusion-cache"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fusion_cache"]
