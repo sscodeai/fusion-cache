@@ -2,6 +2,8 @@
 
 # ⚡ fusion-cache
 
+[English](README.md) | [日本語](README.ja.md)
+
 ### Cut your LLM API costs by up to **97%** — and drop P95 latency from seconds to **0.7 ms**.
 
 A framework-agnostic caching layer for LLM APIs: **exact → semantic → prefix-cache
