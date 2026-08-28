@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, Sequence, Tuple
 
 # Fields of a chat.completions request that change the upstream response and
 # therefore MUST be part of the cache key.
@@ -29,9 +29,16 @@ _RESPONSE_AFFECTING = (
     "logprobs",
     "top_logprobs",
     "n",
+    "seed",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "response_format",
     "modalities",
     "audio",
     "reasoning_effort",
+    "verbosity",
+    "metadata",
 )
 
 # Booleans that change the *transport* but not the logical content.  We keep

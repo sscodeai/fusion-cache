@@ -37,6 +37,24 @@ class TestCanonicalization:
         b = chat_request(model="deepseek-reasoner")
         assert request_hash(a) != request_hash(b)
 
+    def test_tooling_and_response_format_in_key(self):
+        base = chat_request()
+        with_tool = chat_request(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_account",
+                        "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+        json_schema = chat_request(response_format={"type": "json_object"})
+        assert request_hash(base) != request_hash(with_tool)
+        assert request_hash(base) != request_hash(json_schema)
+
     def test_stream_flag_distinguishes(self):
         a = chat_request(stream=False)
         b = chat_request(stream=True)
@@ -207,6 +225,35 @@ class TestSemanticLayer:
         other_model = chat_request(model="gpt-4o", messages=[{"role": "user", "content": "reset password"}])
         r2 = await cache.chat_completion(request=other_model, upstream=upstream, stream=False)
         # structurally incompatible (different model) → guardrail rejects
+        assert r2.layer == "miss"
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_guardrail_different_tools(self):
+        cache = make_cache(similarity_threshold=0.6)
+        calls = 0
+
+        async def upstream(**kwargs):
+            nonlocal calls
+            calls += 1
+            return await fake_upstream(**kwargs)
+
+        base = chat_request(messages=[{"role": "user", "content": "reset password"}])
+        await cache.chat_completion(request=base, upstream=upstream, stream=False)
+
+        with_tool = chat_request(
+            messages=[{"role": "user", "content": "reset password"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "reset_password",
+                        "parameters": {"type": "object", "properties": {"email": {"type": "string"}}},
+                    },
+                }
+            ],
+        )
+        r2 = await cache.chat_completion(request=with_tool, upstream=upstream, stream=False)
         assert r2.layer == "miss"
         assert calls == 2
 

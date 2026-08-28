@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from ..config import FusionCacheConfig
+from ..core.key import canonicalize_request
 from ..semantic.embedder import Embedder
 
 
@@ -71,16 +72,18 @@ class SemanticMatcher:
     def guard_ok(entry: Mapping[str, Any], request: Mapping[str, Any]) -> bool:
         """False-positive guardrail: reject structurally incompatible matches.
 
-        Only *structural* fields are checked — model and stream mode.  Content
-        similarity is the cosine threshold's job; the guardrail exists so a
-        high-similarity query from a different model can never replay a cached
-        response that was generated under different sampling settings.
+        Content similarity is the cosine threshold's job; the guardrail exists
+        so a high-similarity query cannot replay a cached response generated
+        under different model, sampling, tool, or output-format settings.
         """
         meta = entry.get("meta") or {}
         candidate_req = meta.get("_request") if isinstance(meta, dict) else None
         if candidate_req is None:
             return True
-        return (
-            candidate_req.get("model") == request.get("model")
-            and bool(candidate_req.get("stream")) == bool(request.get("stream"))
-        )
+        candidate = canonicalize_request(candidate_req)
+        incoming = canonicalize_request(request)
+        candidate.pop("messages", None)
+        candidate.pop("prompt", None)
+        incoming.pop("messages", None)
+        incoming.pop("prompt", None)
+        return candidate == incoming
